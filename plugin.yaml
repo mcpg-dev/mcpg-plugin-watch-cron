@@ -1,0 +1,15 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.watch.cron
+name: Cron Watch Strategy
+license: Apache-2.0
+description: |
+  A watch_strategy that emits a periodic resource-change tick on an operator
+  schedule, so the gateway re-reads / re-notifies a watched resource on a cron
+  expression or a fixed interval (e.g. re-poll every 5 minutes). Each watcher
+  runs a private background thread until cancelled. The per-watch spec selects
+  exactly one of `cron` (6/7-field, seconds-first), `interval_secs`, or
+  `interval_ms`, with an optional `max_fires` cap. Pure timekeeping — no network.
+class: watch_strategy
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities: []
