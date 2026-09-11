@@ -37,7 +37,7 @@ plugins:
   - id: dev.mcpg.watch.cron
     class: watch_strategy
     source:
-      oci: ghcr.io/mcpg-dev/source-code/plugins/watch-cron:protocol-1
+      oci: ghcr.io/mcpg-dev/plugins/watch-cron
 ```
 
 Each resource that should tick on this schedule selects it under
