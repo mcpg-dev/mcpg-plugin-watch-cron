@@ -13,3 +13,20 @@ class: watch_strategy
 runtime: native-cdylib-v1
 protocol_version: "1.0"
 required_capabilities: []
+# MCP Events: how the cron watch runs as a source, and what it emits. The
+# eventId names the schedule slot; a resumed source raises the slots it missed,
+# at most 100.
+watch_strategies:
+  - kind: cron
+    placement: single_owner
+    resume: true
+    event_types:
+      - name: schedule.fired
+        description: One fire of the schedule.
+        payload_schema:
+          type: object
+          required: [scheduledAt, catchUp]
+          properties:
+            scheduledAt: { type: string, format: date-time }
+            firedAt: { type: string, format: date-time }
+            catchUp: { type: boolean }

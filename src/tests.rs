@@ -74,6 +74,102 @@ fn emitted_event_is_watch_event_json() {
     assert!(v.is_object(), "tick must be a JSON object: {}", evs[0]);
 }
 
+fn events(s: &Sink) -> Vec<mcpg_plugin_protocol::backend::WatchEvent> {
+    s.lock()
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect()
+}
+
+#[test]
+fn an_event_source_raises_schedule_fired_with_the_slot_as_its_id() {
+    let p = plugin();
+    let s = sink();
+    let handle = p
+        .watch(
+            "mcpg-event://ticks",
+            &json!({ "interval_ms": 50, "max_fires": 2 }),
+            emit_for(&s),
+        )
+        .unwrap();
+    sleep(Duration::from_millis(300));
+    p.cancel(handle);
+    let fired = events(&s);
+    assert_eq!(fired.len(), 2);
+    let slot = |e: &mcpg_plugin_protocol::backend::WatchEvent| {
+        e.upstream_cursor.as_ref().unwrap()["last"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(slot(&fired[1]) - slot(&fired[0]), 50, "slots are anchored");
+    for event in &fired {
+        assert_eq!(
+            event.event_type.as_deref(),
+            Some(super::SCHEDULE_FIRED_EVENT_TYPE)
+        );
+        assert_eq!(event.event_id, Some(format!("fire:{}", slot(event))));
+        assert_eq!(event.data.as_ref().unwrap()["catchUp"], false);
+    }
+}
+
+#[test]
+fn a_resumed_event_source_raises_the_missed_fires_first() {
+    let p = plugin();
+    let s = sink();
+    let last = chrono::Utc::now().timestamp_millis() - 3_500;
+    let handle = p
+        .watch(
+            "mcpg-event://ticks",
+            &json!({
+                "interval_secs": 1,
+                mcpg_plugin_protocol::WATCH_RESUME_SPEC_KEY: { "last": last },
+            }),
+            emit_for(&s),
+        )
+        .unwrap();
+    sleep(Duration::from_millis(100));
+    p.cancel(handle);
+    let fired = events(&s);
+    let ids: Vec<String> = fired.iter().filter_map(|e| e.event_id.clone()).collect();
+    assert_eq!(
+        ids,
+        (1..=3)
+            .map(|n| format!("fire:{}", last + n * 1000))
+            .collect::<Vec<_>>(),
+        "the three slots missed since the last fire, in order"
+    );
+    assert!(
+        fired
+            .iter()
+            .all(|e| e.data.as_ref().unwrap()["catchUp"] == true)
+    );
+}
+
+#[test]
+fn catch_up_stops_at_its_cap() {
+    let p = plugin();
+    let s = sink();
+    let last = chrono::Utc::now().timestamp_millis() - 10_000;
+    let handle = p
+        .watch(
+            "mcpg-event://ticks",
+            &json!({
+                "interval_ms": 10,
+                mcpg_plugin_protocol::WATCH_RESUME_SPEC_KEY: { "last": last },
+            }),
+            emit_for(&s),
+        )
+        .unwrap();
+    sleep(Duration::from_millis(100));
+    p.cancel(handle);
+    let caught_up = events(&s)
+        .iter()
+        .filter(|e| e.data.as_ref().unwrap()["catchUp"] == true)
+        .count();
+    assert_eq!(caught_up, super::MAX_CATCH_UP as usize);
+}
+
 #[test]
 fn max_fires_caps_emission() {
     let p = plugin();

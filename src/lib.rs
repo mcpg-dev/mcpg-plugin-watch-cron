@@ -20,7 +20,7 @@ use chrono::Utc;
 use mcpg_plugin_protocol::backend::{WatchError, WatchEvent};
 use mcpg_plugin_protocol::{PluginManifest, firstparty_manifest};
 use mcpg_plugin_sdk::ffi::{SyncWatchStrategyPlugin, WatchHandleBox};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const PLUGIN_ID: &str = "dev.mcpg.watch.cron";
@@ -44,27 +44,63 @@ struct WatchSpec {
     max_fires: Option<u64>,
 }
 
-/// A compiled schedule that yields the delay until its next fire.
+/// The event type of one fire of the schedule.
+pub const SCHEDULE_FIRED_EVENT_TYPE: &str = "schedule.fired";
+
+/// The most missed fires a resumed event source raises; past that it goes
+/// on from the next slot.
+const MAX_CATCH_UP: u32 = 100;
+
+/// An event source's `upstream_cursor`: the slot it fired last.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct CronResume {
+    /// Unix milliseconds of the slot.
+    last: i64,
+}
+
+/// A compiled schedule of fire slots.
 enum Schedule {
     Cron(Box<cron::Schedule>),
     Every(Duration),
 }
 
 impl Schedule {
-    /// Delay from now until the next fire. For cron this is recomputed against
-    /// the wall clock each tick (so it stays aligned to the expression).
-    fn next_delay(&self) -> Duration {
+    /// The first slot after `after`, both in Unix milliseconds. `None` when
+    /// the expression has no later occurrence.
+    fn slot_after(&self, after: i64) -> Option<i64> {
         match self {
-            Schedule::Every(d) => *d,
+            Schedule::Every(d) => after.checked_add(i64::try_from(d.as_millis()).ok()?),
             Schedule::Cron(s) => {
-                let now = Utc::now();
-                match s.upcoming(Utc).next() {
-                    Some(next) => (next - now).to_std().unwrap_or(Duration::from_millis(1)),
-                    // No future occurrence (e.g. a year-pinned past expr): idle.
-                    None => Duration::from_secs(3600),
-                }
+                let at = chrono::DateTime::<Utc>::from_timestamp_millis(after)?;
+                s.after(&at).next().map(|t| t.timestamp_millis())
             }
         }
+    }
+}
+
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+fn rfc3339(millis: i64) -> Option<String> {
+    chrono::DateTime::<Utc>::from_timestamp_millis(millis)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+/// The `schedule.fired` event of `slot`. Its id names the slot, so the same
+/// fire raised twice is one occurrence.
+fn fire_event(slot: i64, catch_up: bool) -> WatchEvent {
+    WatchEvent {
+        event_id: Some(format!("fire:{slot}")),
+        event_type: Some(SCHEDULE_FIRED_EVENT_TYPE.to_owned()),
+        occurred_at: mcpg_plugin_protocol::occurred_at_from_millis(slot),
+        data: Some(serde_json::json!({
+            "scheduledAt": rfc3339(slot),
+            "firedAt": rfc3339(now_ms()),
+            "catchUp": catch_up,
+        })),
+        upstream_cursor: serde_json::to_value(CronResume { last: slot }).ok(),
+        ..WatchEvent::default()
     }
 }
 
@@ -176,16 +212,30 @@ impl SyncWatchStrategyPlugin for CronWatchPlugin {
 
     fn watch(
         &self,
-        _resource_uri: &str,
+        resource_uri: &str,
         spec: &Value,
         emit_event: Box<dyn Fn(&str) + Send + Sync + 'static>,
     ) -> Result<WatchHandleBox, WatchError> {
+        let (spec, resume) = mcpg_plugin_protocol::take_watch_resume(spec);
         let parsed: WatchSpec =
-            serde_json::from_value(spec.clone()).map_err(|e| WatchError::InvalidSpec {
+            serde_json::from_value(spec).map_err(|e| WatchError::InvalidSpec {
                 message: format!("invalid watch spec: {e}"),
             })?;
         let schedule = parsed.compile()?;
         let max_fires = parsed.max_fires;
+        let event_source = mcpg_plugin_protocol::is_event_source(resource_uri);
+        // Where an event source stopped, handed back by the host; a resource
+        // watch has none.
+        let resume: Option<CronResume> = match resume.filter(|_| event_source) {
+            Some(position) => {
+                Some(
+                    serde_json::from_value(position).map_err(|e| WatchError::InvalidSpec {
+                        message: format!("invalid resume position: {e}"),
+                    })?,
+                )
+            }
+            None => None,
+        };
 
         let stop = Arc::new(Stop::new());
         let thread_stop = Arc::clone(&stop);
@@ -198,15 +248,42 @@ impl SyncWatchStrategyPlugin for CronWatchPlugin {
             .name("mcpg-watch-cron".into())
             .spawn(move || {
                 let mut fires: u64 = 0;
+                let mut catch_up_left = if resume.is_some() { MAX_CATCH_UP } else { 0 };
+                let mut next = schedule.slot_after(resume.map_or_else(now_ms, |r| r.last));
                 loop {
-                    let deadline = Instant::now() + schedule.next_delay();
-                    if thread_stop.wait_until(deadline) {
-                        return; // cancelled
+                    let Some(slot) = next else {
+                        // No later occurrence (e.g. a year-pinned past expr): idle.
+                        if thread_stop.wait_until(Instant::now() + Duration::from_secs(3600)) {
+                            return;
+                        }
+                        next = schedule.slot_after(now_ms());
+                        continue;
+                    };
+                    let now = now_ms();
+                    let missed = slot <= now;
+                    if missed && catch_up_left == 0 {
+                        next = schedule.slot_after(now);
+                        continue;
+                    }
+                    if missed {
+                        catch_up_left -= 1;
+                    } else {
+                        let wait = Duration::from_millis(u64::try_from(slot - now).unwrap_or(0));
+                        if thread_stop.wait_until(Instant::now() + wait) {
+                            return; // cancelled
+                        }
                     }
                     if thread_stop.is_stopped() {
                         return;
                     }
-                    emit_event(&tick);
+                    if event_source {
+                        let event = serde_json::to_string(&fire_event(slot, missed))
+                            .unwrap_or_else(|_| tick.clone());
+                        emit_event(&event);
+                    } else {
+                        emit_event(&tick);
+                    }
+                    next = schedule.slot_after(slot);
                     fires += 1;
                     if let Some(max) = max_fires
                         && fires >= max
