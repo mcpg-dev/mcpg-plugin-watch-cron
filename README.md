@@ -75,10 +75,10 @@ Exactly one of `cron`, `interval_secs`, and `interval_ms` must be set. Unknown
 fields are rejected.
 
 ## Change-watching
-The gateway starts one watcher per resource URI when a session first calls
-`resources/subscribe` on it, shares that watcher across every later subscriber,
-and cancels it when the last subscriber goes away — an unsubscribed resource
-consumes no timer thread.
+The gateway starts one watcher per resource URI when a `subscriptions/listen`
+stream first names it in `resourceSubscriptions`, shares that watcher across
+every later subscriber, and cancels it when the last such stream closes — an
+unsubscribed resource consumes no timer thread.
 
 A tick carries no principal and no session: it says the resource changed, not
 who changed it. The gateway turns each tick into
